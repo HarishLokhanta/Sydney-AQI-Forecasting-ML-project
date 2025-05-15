@@ -213,7 +213,7 @@ with tab_forecast:
             st.markdown(
                 f"<div style='padding:0.3em 0.6em;"
                 f"background:{col_raw};color:black;display:inline-block;"
-                f"border-radius:6px'>Current AQI&nbsp;{aqi_raw:.0f} – {cat_raw}</div>",
+                f"border-radius:6px'>Predicted Future AQI&nbsp;{aqi_raw:.0f} – {cat_raw}</div>",
                 unsafe_allow_html=True
             )
             st.markdown("")  # visual gap before the metric rows
