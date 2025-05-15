@@ -1,0 +1,17 @@
+target,horizon,rf_rmse,xgb_rmse
+pm25,1,1.8815674081875065,1.9979811824736204
+pm25,3,2.5861147623317624,2.6777348197803676
+no2,1,0.13248306620844982,0.1210424745013005
+no2,3,0.20749426272147006,0.1976827450150825
+randwick_wsp_1h_average_m_s,1,0.830944819367014,
+randwick_wsp_1h_average_m_s,3,1.0010365925457057,
+earlwood_wsp_1h_average_m_s,1,0.34873024645794576,
+earlwood_wsp_1h_average_m_s,3,0.4433794075531438,
+macquarie_park_wsp_1h_average_m_s,1,0.3965084055010923,
+macquarie_park_wsp_1h_average_m_s,3,0.5218195007180991,
+randwick_temp_1h_average_c,1,1.0485372716930292,
+randwick_temp_1h_average_c,3,1.6147643557973677,
+earlwood_temp_1h_average_c,1,0.9011594431153164,
+earlwood_temp_1h_average_c,3,1.4911298574208847,
+macquarie_park_temp_1h_average_c,1,1.001314648961132,
+macquarie_park_temp_1h_average_c,3,1.6842613420480568,

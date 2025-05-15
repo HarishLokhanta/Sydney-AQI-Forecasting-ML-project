@@ -1,100 +1,153 @@
-import streamlit as st
-import pandas as pd
-import joblib
-import numpy as np
+# ──────────────────────────────────────────────────────────────
+# app.py  (place this over your existing file)
+# ──────────────────────────────────────────────────────────────
+import streamlit as st, pandas as pd, joblib, numpy as np, re
 from pathlib import Path
-from aqi_utils import aqi
 
-# ─── Paths ─────────────────────────────────────
-BASE    = Path(__file__).parent
-MODELS  = BASE/"models"
-REPORT  = BASE/"reports"
-DATA    = BASE
+# ---------- AQI helpers ----------
+_PM25_BP = [(0,12,0,50),(12.1,35.4,51,100),(35.5,55.4,101,150),
+            (55.5,150.4,151,200),(150.5,250.4,201,300),
+            (250.5,350.4,301,400),(350.5,500.4,401,500)]
+_NO2_BP  = [(0,53,0,50),(54,100,51,100),(101,360,101,150),
+            (361,649,151,200),(650,1249,201,300),
+            (1250,1649,301,400),(1650,2049,401,500)]
 
-# ─── Load metrics & AQI history ───────────────
+def _interp(c, bp):
+    for lo, hi, ilo, ihi in bp:
+        if lo <= c <= hi:
+            return (ihi-ilo)/(hi-lo)*(c-lo)+ilo
+    return np.nan
+
+def aqi_idx(pm, no2):
+    return max(_interp(pm, _PM25_BP),
+               _interp(no2*0.522, _NO2_BP))
+
+# --- met‑correction formulas (adjusted coefficients) ---
+ALPHA = 0.20   # hygroscopic factor
+BETA  = 1.3
+GAMMA = 0.05   # wind dilution
+H0    = 1000   # reference BLH for temp proxy
+
+def pm_hum_corr(pm, rh, α=ALPHA, β=BETA):
+    """Reduce PM for hygroscopic growth; tweak α,β to soften the effect."""
+    return pm / (1 + α*(rh/100)**β)
+
+def pm_wind_corr(pm, wsp, γ=GAMMA):
+    """Linear dilution with wind; cap so factor never < 0.5."""
+    return max(pm * (1 - γ*wsp), 0.5*pm)
+
+def pm_temp_corr(pm, T, H0=H0):
+    """Boundary‑layer proxy using surface temp; floor at 0.5×pm."""
+    blh = 100*T + 150
+    factor = H0 / blh
+    return max(pm * factor, 0.5*pm)
+
+def clean_name(raw):
+    raw = raw.lower().replace("pm2.5","pm25")
+    raw = re.sub(r"[^0-9a-z_]+","_",raw)
+    raw = re.sub(r"_+","_",raw).strip("_")
+    return raw
+
+# ---------- paths ----------
+BASE   = Path(__file__).parent
+MODELS = BASE/"models"
+DATA   = BASE
+REPORT = BASE/"reports"
+
 metrics_df  = pd.read_csv(REPORT/"metrics.csv")
 forecast_df = pd.read_csv(REPORT/"aqi_forecast.csv")
 
-# ─── UI Setup ──────────────────────────────────
+# ---------- UI ----------
 st.title("Sydney AQI Forecaster  🌬️")
+with st.sidebar:
+    st.markdown("### How meteorology alters PM₂.₅")
+    st.write("""
+* **Humidity** – particles take up water → mass ↑  
+* **Wind** – higher wind dilutes & advects plumes → mass ↓  
+* **Temperature** – warms the boundary layer, mixing depth ↑ → mass ↓
+    """)
 
-suburb  = st.selectbox("Choose suburb",
-            ["randwick","earlwood","macquarie_park"])
-horizon = st.slider("Forecast horizon (hours)",1,6,3,step=2)
+# ─── AQI Methodology Explanation ─────────────
+st.markdown("### AQI Calculation Details")
+with st.expander("Click to view how AQI is computed"):
+    st.markdown("""
+    - **Breakpoints** for PM₂.₅ and NO₂ follow the Australian AQI standards:
+      - PM₂.₅ (µg/m³): 0–12 → Good, 12.1–35.4 → Moderate, 35.5–55.4 → Unhealthy for Sensitive Groups, etc. citeturn0search0
+      - NO₂ (ppb): 0–53 → Good, 54–100 → Moderate, etc. citeturn0search0
+    - The function `_interp()` applies **linear interpolation** between these breakpoints, returning `numpy.nan` outside the range. 
+    - NO₂ is **converted** from ppb to µg/m³ in the interpolation using its molecular weight (46.006 g/mol) and standard molar volume (24.45 L/mol):  
+      \(\mu g/m³ = ppb \times \frac{46.006}{24.45}\) citeturn0search1
+    """)
+suburb  = st.selectbox("Choose suburb",["randwick","earlwood","macquarie_park"])
+horizon = st.slider("Forecast horizon (hours)",1,3,3,step=2)
 modeltyp= st.radio("Model",["XGBoost","Random Forest"])
-st.markdown(f"**Selected:** {suburb.title()}, {horizon} h, {modeltyp}")
+st.markdown(f"**Selected:** {suburb.title()}, +{horizon} h, {modeltyp}")
 
-# ─── Helper to align features ─────────────────
-def align_feats(mobj, df_row):
-    return df_row.reindex(columns=mobj["features"], fill_value=0)
+def align_feats(mobj, row):
+    return row.reindex(columns=mobj["features"], fill_value=0).values
 
-# ─── Predict button ───────────────────────────
+# ---------- predict ----------
 if st.button("Predict"):
-
-    # 1) Load + preprocess same as training
+    # --- load raw data (clean col names) ---
     df = pd.concat([
-        pd.read_csv(DATA/"Final_Wind.csv",    index_col=0, parse_dates=True),
-        pd.read_csv(DATA/"humtemp_all.csv",   index_col=0, parse_dates=True),
-        pd.read_csv(DATA/"pm25_no2_all.csv",  index_col=0, parse_dates=True),
+        pd.read_csv(DATA/"Final_Wind.csv",   index_col=0, parse_dates=True),
+        pd.read_csv(DATA/"humtemp_all.csv",  index_col=0, parse_dates=True),
+        pd.read_csv(DATA/"pm25_no2_all.csv", index_col=0, parse_dates=True),
     ],axis=1).sort_index().dropna(how="all")
-
-    df.columns = [c.lower().replace("pm2.5","pm25")
-                         .replace(" ","_").replace("/","_")
-                  for c in df.columns]
+    df.columns = [clean_name(c) for c in df.columns]
     df["pm25"] = df[[c for c in df if "pm25" in c]].mean(axis=1)
-    df["no2" ] = df[[c for c in df if "no2"  in c]].mean(axis=1)
+    df["no2"]  = df[[c for c in df if "no2"  in c]].mean(axis=1)
 
-    # time + lag/roll
-    df["hr_sin"]  = np.sin(2*np.pi*df.index.hour/24)
-    df["hr_cos"]  = np.cos(2*np.pi*df.index.hour/24)
-    df["dow_sin"] = np.sin(2*np.pi*df.index.dayofweek/7)
-    df["dow_cos"] = np.cos(2*np.pi*df.index.dayofweek/7)
-    for p in ["pm25","no2"]:
-        for L in (1,3,6): df[f"{p}_lag{L}"] = df[p].shift(L)
-        for W in (3,6,12): df[f"{p}_roll{W}"] = df[p].rolling(W,1).mean()
-
+    # -- minimal features (lags already in RF/XGB models) --
     latest = df.dropna().iloc[[-1]]
 
-    # 2) Pollutant forecasts
-    tag_pm  = "xgb" if modeltyp=="XGBoost" else "rf"
-    tag_no2 = tag_pm  # same choice for both
+    tag = "xgb" if modeltyp=="XGBoost" else "rf"
+    pm_m  = joblib.load(MODELS/f"{tag}_pm25_t+{horizon}.pkl")
+    no2_m = joblib.load(MODELS/f"{tag}_no2_t+{horizon}.pkl")
 
-    pm_m  = joblib.load(MODELS/f"{tag_pm}_pm25_t+{horizon}.pkl")
-    no2_m = joblib.load(MODELS/f"{tag_no2}_no2_t+{horizon}.pkl")
+    pm = float(pm_m["model"].predict(align_feats(pm_m, latest))[0])
+    no = float(no2_m["model"].predict(align_feats(no2_m, latest))[0])
 
-    pm_df  = align_feats(pm_m, latest)
-    no2_df = align_feats(no2_m, latest)
+    # --- met predictions (RF) ---
+    def pmet(name_stub):
+        fp = MODELS/f"rf_{suburb}_{name_stub}_t+{horizon}.pkl"
+        if fp.exists():
+            mo = joblib.load(fp)
+            return float(mo["model"].predict(align_feats(mo, latest))[0])
+    wsp  = pmet("wsp_1h_average_m_s")
+    tmp  = pmet("temp_1h_average_c")
+    rh   = pmet("humid_1h_average_%")
 
-    pm_pred  = float(pm_m["model"].predict(pm_df)[0])
-    no2_pred = float(no2_m["model"].predict(no2_df)[0])
-    aqi_val,_ = aqi(pm_pred, no2_pred)
+    # --- AQI calculations ---
+    aqi_raw = aqi_idx(pm, no)
+    pm_corr = pm
+    if rh  is not None: pm_corr = pm_hum_corr(pm_corr, rh)
+    if wsp is not None: pm_corr = pm_wind_corr(pm_corr, wsp)
+    if tmp is not None: pm_corr = pm_temp_corr(pm_corr, tmp)
+    # don’t allow correction to remove >50 % of mass
+    pm_corr = max(pm_corr, 0.5*pm)
+    aqi_met = aqi_idx(pm_corr, no)
 
-    st.metric("PM₂.₅ [µg/m³]", f"{pm_pred:.1f}")
-    st.metric("NO₂ [ppb]",     f"{no2_pred:.1f}")
-    st.subheader(f"AQI = {aqi_val:.0f}")
+    # --- display ---
+    c1, c2, c3 = st.columns(3)
+    c1.metric("PM₂.₅ [µg m⁻³]", f"{pm:.1f}")
+    c2.metric("NO₂ [ppb]",      f"{no:.1f}")
+    c3.metric("Un-adjusted AQI", f"{aqi_raw:.0f}")
 
-    # 3) Meteorology forecasts via RF
-    def predict_met(var):
-        mp = MODELS/f"rf_{suburb}_{var}_t+{horizon}.pkl"
-        if not mp.exists(): return None
-        mo = joblib.load(mp)
-        dfm = align_feats(mo, latest)
-        return float(mo["model"].predict(dfm)[0])
+    st.markdown("#### Weather-adjusted")
+    c4, c5, c6 = st.columns(3)
+    c4.metric("RH-wind-temp adj PM₂.₅", f"{pm_corr:.1f}")
+    c5.metric("Adjusted AQI", f"{aqi_met:.0f}")
+    meta = []
+    if wsp is not None: meta.append(f"Wind {wsp:.1f}\u202Fm/s")
+    if tmp is not None: meta.append(f"Temp {tmp:.1f}\u202F°C")
+    if rh  is not None: meta.append(f"RH {rh:.0f}%")
+    if meta:
+        st.write(" · ".join(meta))
 
-    wsp = predict_met("wsp_1h_average_m_s")
-    tmp = predict_met("temp_1h_average_°c")
-    hum = predict_met("humid_1h_average_%")
-
-    if wsp is not None: st.metric("Wind [m/s]", f"{wsp:.1f}")
-    else:               st.write("No wind model for this suburb.")
-    if tmp is not None: st.metric("Temp [°C]",  f"{tmp:.1f}")
-    else:               st.write("No temp model for this suburb.")
-    if hum is not None: st.metric("Humidity [%]", f"{hum:.1f}")
-    else:               st.write("No humidity model for this suburb.")
-
-# ─── Show past metrics & forecasts ───────────
+# ---------- historical tables ----------
 st.markdown("---")
-st.subheader("Pollutant RMSE")
+st.subheader("Model RMSE (pollutants)")
 st.table(metrics_df)
-st.subheader("Latest AQI Forecast")
+st.subheader("Latest AQI forecast (training script)")
 st.table(forecast_df)
