@@ -1,247 +1,155 @@
 #!/usr/bin/env python3
 """
-Train XGBoost & Random-Forest forecasters for
+ENGG2112-style forecasters (Linear, Ridge, KNN, Decision-Tree, Random-Forest)
+for PM₂.₅, NO₂, and basic meteorological variables.
 
- • PM₂.₅, NO₂  (horizons = 1 h, 3 h)
- • Wind-speed, Temperature, Humidity (Randwick, Earlwood, Macquarie Park)
+ • Data: humtemp_all.csv, pm25_no2_all.csv, Final_Wind.csv
+ • Horizons: 1 h and 3 h ahead
+ • 80 % / 20 % chronological split
+ • Metric: Mean-Squared-Error (MSE)
 
-Outputs → models/
-  rf_<target>_t+<H>.pkl         (all targets)
-  xgb_<target>_t+<H>.pkl        (pollutants only)
-
-Metrics
-  reports/metrics.csv           ← pollutants only
-  reports/metrics_all.csv       ← pollutants + meteorology
-  reports/aqi_forecast.csv      ← quick 1 h & 3 h AQI forecast
-
-Set environment variable **OPTUNA_TRIALS** to control how many hyper-parameter
-trials to run (0 = skip Optuna and use default XGB params for fastest run).
+Outputs
+ ├─ models/
+ │   └─ <model>_<target>_t+{1|3}.pkl
+ └─ reports/
+     ├─ metrics_all.csv
+     └─ aqi_forecast.csv
 """
+# ──────────────────────────────────────────────────────────────
 from pathlib import Path
-import warnings, re, os, joblib, json  # json kept for potential future logging
+import re, os, warnings, joblib
+import numpy as np, pandas as pd
 
-import numpy as np
-import pandas as pd
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor
-from xgboost import XGBRegressor
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-from sklearn.model_selection import TimeSeriesSplit
-import optuna
-import shap
-import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 
-# -----------------------------------------------------------------------------
-# Monkey-patch for SHAP API changes (v0.47+ removed summary_plot)
-# -----------------------------------------------------------------------------
-if not hasattr(shap, "summary_plot"):
-    shap.summary_plot = shap.plots.bar  # graceful fallback
+# ══════════════════ Helper paths ═════════════════════════════
+ROOT   = Path(__file__).parent if "__file__" in globals() else Path.cwd()
+DATA   = ROOT / "data"
+MODELS = (ROOT / "models").mkdir(exist_ok=True) or ROOT / "models"
+REPORT = (ROOT / "reports").mkdir(exist_ok=True) or ROOT / "reports"
 
-# -----------------------------------------------------------------------------
-# Optuna toggle (default 0 = no hyper-tuning → fastest)
-# -----------------------------------------------------------------------------
-N_TRIALS = int(os.getenv("OPTUNA_TRIALS", "0"))
+# ═══════════ Load & combine the three CSVs ═══════════════════
+def clean(col: str) -> str:
+    col = col.lower().replace("pm2.5", "pm25")
+    col = re.sub(r"[^0-9a-z_]+", "_", col)
+    return re.sub(r"_+", "_", col).strip("_")
 
-# ───────────── AQI helpers ─────────────
-AQI_BREAKPOINTS = {
-    "pm25": [
-        (0.0, 12.0, 0, 50), (12.1, 35.4, 51, 100), (35.5, 55.4, 101, 150),
-        (55.5, 150.4, 151, 200), (150.5, 250.4, 201, 300),
-        (250.5, 350.4, 301, 400), (350.5, 500.4, 401, 500)],
-    "no2": [
-        (0, 53, 0, 50), (54, 100, 51, 100), (101, 360, 101, 150),
-        (361, 649, 151, 200), (650, 1249, 201, 300),
-        (1250, 1649, 301, 400), (1650, 2049, 401, 500)]
-}
+dfs = [pd.read_csv(DATA / f, index_col=0, parse_dates=True)
+       for f in ("Final_Wind.csv", "humtemp_all.csv", "pm25_no2_all.csv")]
 
-def _aqi_piecewise(pollutant: str, conc: float) -> float:
-    """Linear interpolation between AQI break-points."""
-    for lo, hi, ilo, ihi in AQI_BREAKPOINTS[pollutant]:
-        if lo <= conc <= hi:
-            return (ihi - ilo) / (hi - lo) * (conc - lo) + ilo
-    return np.nan
+wide = (pd.concat(dfs, axis=1)
+          .sort_index()
+          .dropna(how="all"))
+wide.columns = [clean(c) for c in wide.columns]
 
-def overall_aqi(pm: float, no2: float):
-    """Return overall AQI + sub-indices dict."""
-    a = _aqi_piecewise("pm25", pm)
-    b = _aqi_piecewise("no2",  no2)
-    return max(a, b), {"pm25": a, "no2": b}
+# city-wide pollutant means (single target each)
+wide["pm25"] = wide[[c for c in wide if "pm25" in c]].mean(axis=1)
+wide["no2"]  = wide[[c for c in wide if "no2"  in c]].mean(axis=1)
+wide.drop(columns=[c for c in wide
+                   if ("pm25" in c or "no2" in c) and "_" in c],
+          inplace=True)
 
-# ───────────── Paths ─────────────
-ROOT   = Path(__file__).parent
-MODELS = ROOT / "models";  MODELS.mkdir(exist_ok=True)
-REPORT = ROOT / "reports"; REPORT.mkdir(exist_ok=True)
-DATA   = ROOT
-
-# ───────────── Load & clean data ─────────────
-
-def clean_name(raw: str) -> str:
-    raw = raw.lower().replace("pm2.5", "pm25")
-    raw = re.sub(r"[^0-9a-z_]+", "_", raw)
-    raw = re.sub(r"_+", "_", raw).strip("_")
-    return raw
-
-print("Loading CSVs …")
-dfs = [
-    pd.read_csv(DATA / "Final_Wind.csv",   index_col=0, parse_dates=True),
-    pd.read_csv(DATA / "humtemp_all.csv",  index_col=0, parse_dates=True),
-    pd.read_csv(DATA / "pm25_no2_all.csv", index_col=0, parse_dates=True),
-]
-wide = pd.concat(dfs, axis=1).sort_index().dropna(how="all")
-wide.columns = [clean_name(c) for c in wide.columns]
-
-# city-wide pollutant targets
-wide["pm25"] = wide[[c for c in wide.columns if "pm25" in c]].mean(axis=1)
-wide["no2"]  = wide[[c for c in wide.columns if "no2"  in c]].mean(axis=1)
-# drop redundant site-specific pollutant cols
-poll_cols = [c for c in wide.columns if ("pm25" in c or "no2" in c) and "_" in c]
-wide.drop(columns=[c for c in poll_cols if c not in ("pm25", "no2")], inplace=True)
-
-# basic cyclic time features + lags/rolling means
-wide["hr_sin"]  = np.sin(2 * np.pi * wide.index.hour / 24)
-wide["hr_cos"]  = np.cos(2 * np.pi * wide.index.hour / 24)
+# ═══════════ Simple temporal / lag / roll features ═══════════
+wide["hr_sin"]  = np.sin(2 * np.pi * wide.index.hour      / 24)
+wide["hr_cos"]  = np.cos(2 * np.pi * wide.index.hour      / 24)
 wide["dow_sin"] = np.sin(2 * np.pi * wide.index.dayofweek / 7)
 wide["dow_cos"] = np.cos(2 * np.pi * wide.index.dayofweek / 7)
+
 for p in ("pm25", "no2"):
-    for L in (1, 3, 6):  wide[f"{p}_lag{L}"]  = wide[p].shift(L)
-    for W in (3, 6, 12): wide[f"{p}_roll{W}"] = wide[p].rolling(W, 1).mean()
+    wide[f"{p}_lag1"]  = wide[p].shift(1)
+    wide[f"{p}_lag3"]  = wide[p].shift(3)
+    wide[f"{p}_roll3"] = wide[p].rolling(3, min_periods=1).mean()
+    wide[f"{p}_roll6"] = wide[p].rolling(6, min_periods=1).mean()
 
-# ───────────── Targets ─────────────
+# ═════════════════ Target lists ══════════════════════════════
 SUBURBS = ["randwick", "earlwood", "macquarie_park"]
-MET_TARGETS = [
-    c for c in wide.columns
-    if any(c.startswith(f"{sb}_") for sb in SUBURBS)
-    and (
-        ("_wsp_" in c and c.endswith("_m_s")) or
-        ("_temp_" in c and "average" in c)   or
-        ("_humid_" in c and c.endswith("_%"))
-    )
-]
+MET_TARGETS = [c for c in wide.columns
+               if any(c.startswith(sb + "_") for sb in SUBURBS)
+               and any(k in c for k in ("_wsp_", "_temp_", "_humid_"))
+               and c.endswith(("_m_s", "average_c", "_%"))]
 
+TARGETS  = ["pm25", "no2"] + MET_TARGETS
 HORIZONS = [1, 3]
-WF_CV = TimeSeriesSplit(n_splits=6)   # walk-forward CV for metrics
-(REPORT / "shap").mkdir(exist_ok=True)
 
-rows, rows_all = [], []
+# ════════════════ Model zoo from lectures ════════════════════
+MODEL_SPECS = {
+    "lin":   LinearRegression(),
+    "ridge": Ridge(alpha=1.0),
+    "knn":   KNeighborsRegressor(n_neighbors=5, weights="distance"),
+    "tree":  DecisionTreeRegressor(max_depth=12, random_state=42),
+    "rf":    RandomForestRegressor(n_estimators=300,
+                                   max_depth=18,
+                                   min_samples_leaf=2,
+                                   n_jobs=-1,
+                                   random_state=42),
+}
 
-print("Training models … (N_TRIALS=%d)" % N_TRIALS)
+# ══════════════ Training / evaluation loop ═══════════════════
+rows_all = []
 
-for tgt in ["pm25", "no2"] + MET_TARGETS:
+for tgt in TARGETS:
     for H in HORIZONS:
-        y = wide[tgt].shift(-H)
+        y_shifted = wide[tgt].shift(-H)
         X = wide.drop(columns=[tgt]).dropna()
-        df0 = pd.concat([X, y.rename("y")], axis=1).dropna()
-        X0, y0 = df0.drop(columns="y"), df0["y"]
-        split = int(len(X0) * 0.8)
-        Xtr, Xte = X0.iloc[:split], X0.iloc[split:]
-        ytr, yte = y0.iloc[:split], y0.iloc[split:]
+        df = pd.concat([X, y_shifted.rename("y")], axis=1).dropna()
 
-        # --- Random-Forest (all targets) ------------------------------
-        rf = RandomForestRegressor(
-            n_estimators=100,
-            min_samples_leaf=2,
-            n_jobs=-1,
-            random_state=42,
-        )
-        rf.fit(Xtr, ytr)
-        rmse_rf = np.sqrt(mean_squared_error(yte, rf.predict(Xte)))
-        mae_rf  = mean_absolute_error(yte, rf.predict(Xte))
-        joblib.dump({"model": rf, "features": list(Xtr.columns)},
-                    MODELS / f"rf_{tgt}_t+{H}.pkl")
+        X_all, y_all = df.drop(columns="y"), df["y"]
+        split = int(len(X_all) * 0.8)          # chronological
 
-        # --- XGBoost (pollutants only) -------------------------------
-        rmse_xgb = mae_xgb = np.nan
-        if tgt in ("pm25", "no2"):
+        X_tr, X_te = X_all.iloc[:split], X_all.iloc[split:]
+        y_tr, y_te = y_all.iloc[:split], y_all.iloc[split:]
 
-            def objective(trial):
-                params = {
-                    "n_estimators": trial.suggest_int("n_estimators", 200, 600, 100),
-                    "max_depth":    trial.suggest_int("max_depth", 4, 10),
-                    "eta":          trial.suggest_float("eta", 0.01, 0.3, log=True),
-                    "subsample":    trial.suggest_float("subsample", 0.5, 1.0),
-                    "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-                    "objective": "reg:squarederror",
-                    "n_jobs": -1,
-                    "random_state": 42,
-                }
-                mdl = XGBRegressor(**params)
-                rmses, maes = [], []
-                for tr_idx, te_idx in WF_CV.split(X0):
-                    mdl.fit(X0.values[tr_idx], y0.values[tr_idx])
-                    pred = mdl.predict(X0.values[te_idx])
-                    rmses.append(np.sqrt(mean_squared_error(y0.values[te_idx], pred)))
-                    maes.append(mean_absolute_error(y0.values[te_idx], pred))
-                trial.set_user_attr("mae", float(np.mean(maes)))
-                return np.mean(rmses)
+        for tag, model in MODEL_SPECS.items():
+            mdl = model.fit(X_tr, y_tr)
+            y_hat = mdl.predict(X_te)
+            mse   = mean_squared_error(y_te, y_hat)
 
-            study = optuna.create_study(direction="minimize")
+            rows_all.append(dict(model=tag, target=tgt, horizon=H, mse=mse))
+            joblib.dump({"model": mdl, "features": list(X_tr)},
+                        MODELS / f"{tag}_{tgt}_t+{H}.pkl")
 
-            if N_TRIALS > 0:
-                study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=False)
-            else:  # quick path with hand-picked defaults
-                study.enqueue_trial({
-                    "n_estimators": 400,
-                    "max_depth": 6,
-                    "eta": 0.03,
-                    "subsample": 0.8,
-                    "colsample_bytree": 0.96,
-                })
-                study.optimize(objective, n_trials=1, show_progress_bar=False)
+            print(f"✓ {tag.upper():5s}  {tgt:25s}  t+{H}: MSE = {mse:.3f}")
 
-            best_params = study.best_params
-            best_params.update({"objective": "reg:squarederror", "n_jobs": -1, "random_state": 42})
-            best = XGBRegressor(**best_params)
-            best.fit(Xtr.values, ytr)
-            rmse_xgb = np.sqrt(mean_squared_error(yte, best.predict(Xte.values)))
-            mae_xgb  = mean_absolute_error(yte, best.predict(Xte.values))
-
-            # SHAP explainability
-            try:
-                expl = shap.TreeExplainer(best)
-                shap_vals = expl.shap_values(Xtr.sample(min(4000, len(Xtr))).values)
-                shap.plots.bar(shap_vals, max_display=20, show=False)
-                shap_path = REPORT / f"shap/shap_{tgt}_t+{H}.png"
-                plt.tight_layout()
-                plt.savefig(shap_path, dpi=180)
-                plt.close()
-            except Exception as e:
-                print(f"[SHAP] skipped for {tgt} t+{H}:", e)
-
-            joblib.dump({"model": best, "features": list(Xtr.columns)},
-                        MODELS / f"xgb_{tgt}_t+{H}.pkl")
-
-        rows_all.append({"target": tgt, "horizon": H,
-                         "rf_rmse": rmse_rf, "xgb_rmse": rmse_xgb})
-        if tgt in ("pm25", "no2"):
-            rows.append({"pollutant": tgt, "horizon": H,
-                         "rf_rmse": rmse_rf, "xgb_rmse": rmse_xgb,
-                         "rf_mae": mae_rf, "xgb_mae": mae_xgb})
-
-# Save metric tables
-pd.DataFrame(rows).to_csv(REPORT / "metrics.csv", index=False)
+# ═════════════ Write out the metrics tables ══════════════════
 pd.DataFrame(rows_all).to_csv(REPORT / "metrics_all.csv", index=False)
-print("✓ metrics saved")
+pd.DataFrame([r for r in rows_all if r["target"] in ("pm25", "no2")]) \
+  .to_csv(REPORT / "metrics_pollutants_all_models.csv", index=False)
+print("✓ metrics saved  → reports/*.csv")
 
-# ───────────── Quick AQI forecast (for last timestamp) ─────────────
+# ═════════════ Quick AQI forecast with RF models ═════════════
+def quick(path: Path, row: pd.Series) -> float:
+    obj   = joblib.load(path)
+    feats = row.reindex(columns=obj["features"], fill_value=0).values
+    return float(obj["model"].predict(feats.reshape(1, -1))[0])
 
-def quick_pred(path: Path, row: pd.DataFrame) -> float:
-    obj = joblib.load(path)
-    feat = row.reindex(columns=obj["features"], fill_value=0).values
-    return float(obj["model"].predict(feat)[0])
-
-latest = wide.iloc[[-1]].copy()  # keep ALL cols for feature alignment
+latest = wide.dropna().iloc[[-1]]
 out = []
-for H in (1, 3):
-    pm  = quick_pred(MODELS / f"xgb_pm25_t+{H}.pkl", latest)
-    no2 = quick_pred(MODELS / f"xgb_no2_t+{H}.pkl",  latest)
-    aqi, subs = overall_aqi(pm, no2)
-    out.append({"horizon": H,
-                "pm25_pred": pm,
-                "no2_pred": no2,
-                "aqi": aqi,
-                "pm25_index": subs["pm25"],
-                "no2_index": subs["no2"]})
+for H in HORIZONS:
+    pm  = quick(MODELS / f"rf_pm25_t+{H}.pkl", latest)
+    no2 = quick(MODELS / f"rf_no2_t+{H}.pkl",  latest)
+
+    # very simple Australian AQI indices
+    def aqi_idx(val, pollutant="pm25"):
+        bp = ( (0,12,0,50), (12.1,35.4,51,100), (35.5,55.4,101,150),
+               (55.5,150.4,151,200), (150.5,250.4,201,300),
+               (250.5,350.4,301,400), (350.5,500.4,401,500) )
+        for lo, hi, a, b in bp:
+            if lo <= val <= hi:
+                return (b - a) / (hi - lo) * (val - lo) + a
+        return np.nan
+
+    aqi_pm  = aqi_idx(pm,  "pm25")
+    aqi_no2 = aqi_idx(no2, "no2")
+    out.append(dict(horizon=H, pm25_pred=pm, no2_pred=no2,
+                    pm25_index=aqi_pm, no2_index=aqi_no2,
+                    aqi=max(aqi_pm, aqi_no2)))
 
 pd.DataFrame(out).to_csv(REPORT / "aqi_forecast.csv", index=False)
 print("✓ AQI forecast saved → reports/aqi_forecast.csv")
