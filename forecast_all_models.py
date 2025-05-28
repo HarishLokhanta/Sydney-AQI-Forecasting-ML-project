@@ -6,13 +6,14 @@ for PM₂.₅, NO₂, and basic meteorological variables.
  • Data: humtemp_all.csv, pm25_no2_all.csv, Final_Wind.csv
  • Horizons: 1 h and 3 h ahead
  • 80 % / 20 % chronological split
- • Metric: Mean-Squared-Error (MSE)
+ • Metrics: Mean-Squared-Error (MSE) and Coefficient of Determination (R²)
 
 Outputs
  ├─ models/
  │   └─ <model>_<target>_t+{1|3}.pkl
  └─ reports/
      ├─ metrics_all.csv
+     ├─ metrics_pollutants_all_models.csv
      └─ aqi_forecast.csv
 """
 # ──────────────────────────────────────────────────────────────
@@ -20,7 +21,7 @@ from pathlib import Path
 import re, os, warnings, joblib
 import numpy as np, pandas as pd
 
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.neighbors import KNeighborsRegressor
@@ -51,7 +52,7 @@ wide.columns = [clean(c) for c in wide.columns]
 
 # city-wide pollutant means (single target each)
 wide["pm25"] = wide[[c for c in wide if "pm25" in c]].mean(axis=1)
-wide["no2"]  = wide[[c for c in wide if "no2"  in c]].mean(axis=1)
+wide["no2"]  = wide[[c for c in wide if "no2" in c]].mean(axis=1)
 wide.drop(columns=[c for c in wide
                    if ("pm25" in c or "no2" in c) and "_" in c],
           inplace=True)
@@ -96,12 +97,13 @@ rows_all = []
 
 for tgt in TARGETS:
     for H in HORIZONS:
+        # shift target
         y_shifted = wide[tgt].shift(-H)
         X = wide.drop(columns=[tgt]).dropna()
         df = pd.concat([X, y_shifted.rename("y")], axis=1).dropna()
 
         X_all, y_all = df.drop(columns="y"), df["y"]
-        split = int(len(X_all) * 0.8)          # chronological
+        split = int(len(X_all) * 0.8)          # chronological split
 
         X_tr, X_te = X_all.iloc[:split], X_all.iloc[split:]
         y_tr, y_te = y_all.iloc[:split], y_all.iloc[split:]
@@ -110,17 +112,27 @@ for tgt in TARGETS:
             mdl = model.fit(X_tr, y_tr)
             y_hat = mdl.predict(X_te)
             mse   = mean_squared_error(y_te, y_hat)
+            r2    = r2_score(y_te, y_hat)
 
-            rows_all.append(dict(model=tag, target=tgt, horizon=H, mse=mse))
+            rows_all.append({
+                "model": tag,
+                "target": tgt,
+                "horizon": H,
+                "mse": mse,
+                "r2": r2,
+            })
+
+            # save model + feature list
             joblib.dump({"model": mdl, "features": list(X_tr)},
                         MODELS / f"{tag}_{tgt}_t+{H}.pkl")
 
-            print(f"✓ {tag.upper():5s}  {tgt:25s}  t+{H}: MSE = {mse:.3f}")
+            print(f"✓ {tag.upper():5s}  {tgt:25s}  t+{H}: MSE = {mse:.3f}, R² = {r2:.3f}")
 
 # ═════════════ Write out the metrics tables ══════════════════
-pd.DataFrame(rows_all).to_csv(REPORT / "metrics_all.csv", index=False)
-pd.DataFrame([r for r in rows_all if r["target"] in ("pm25", "no2")]) \
-  .to_csv(REPORT / "metrics_pollutants_all_models.csv", index=False)
+metrics_df = pd.DataFrame(rows_all)
+metrics_df.to_csv(REPORT / "metrics_all.csv", index=False)
+# pollutant-only subset
+metrics_df[metrics_df.target.isin(["pm25", "no2"])].to_csv(REPORT / "metrics_pollutants_all_models.csv", index=False)
 print("✓ metrics saved  → reports/*.csv")
 
 # ═════════════ Quick AQI forecast with RF models ═════════════
@@ -137,9 +149,9 @@ for H in HORIZONS:
 
     # very simple Australian AQI indices
     def aqi_idx(val, pollutant="pm25"):
-        bp = ( (0,12,0,50), (12.1,35.4,51,100), (35.5,55.4,101,150),
-               (55.5,150.4,151,200), (150.5,250.4,201,300),
-               (250.5,350.4,301,400), (350.5,500.4,401,500) )
+        bp = ((0,12,0,50), (12.1,35.4,51,100), (35.5,55.4,101,150),
+              (55.5,150.4,151,200), (150.5,250.4,201,300),
+              (250.5,350.4,301,400), (350.5,500.4,401,500))
         for lo, hi, a, b in bp:
             if lo <= val <= hi:
                 return (b - a) / (hi - lo) * (val - lo) + a
