@@ -60,21 +60,19 @@ seasonal_features(wide)
 for p in ("pm25", "no2"):
     lag_roll(wide, p)
 
-# ---------- auto-detect suburb meteo columns ---------------------------------
-meta_pattern = re.compile(r"(.+?)_((wsp|temp|humid).*?)$")   # suburb + stub
-met_columns  = [c for c in wide.columns
-                if meta_pattern.match(c) and c.endswith(("_m_s", "_c", "_%"))]
-
-suburbs = sorted({meta_pattern.match(c).group(1) for c in met_columns})
-print(f"Detected suburbs: {', '.join(suburbs)}")
-
-# add city-wide averages --------------------------------------
+# only generate & train city-wide ("Sydney") meteorology targets
 for stub in ("wsp_1h_average_m_s", "temp_1h_average_c", "humid_1h_average_%"):
-    cols = [f"{s}_{stub}" for s in suburbs if f"{s}_{stub}" in wide.columns]
-    if cols:                           # humidity may be missing
+    # compute Sydney-avg directly
+    cols = [c for c in wide.columns if c.endswith(stub)]
+    if cols:  # skip if, e.g., no humidity in data
         wide[f"sydney_{stub}"] = wide[cols].mean(axis=1)
-        met_columns.append(f"sydney_{stub}")
 
+# now only train on those three city-wide columns:
+met_columns = [
+    f"sydney_{stub}"
+    for stub in ("wsp_1h_average_m_s", "temp_1h_average_c", "humid_1h_average_%")
+    if f"sydney_{stub}" in wide.columns
+]
 # ---------- training -----------------------------------------
 HORIZONS = (1, 3)
 RF_KW    = dict(n_estimators=300, max_depth=18,
@@ -133,8 +131,8 @@ rows   = []
 
 for H in HORIZONS:
     row = {"horizon": H}
-    row["pm25_pred"] = predict(MODELS / f"lin_pm25_t+{H}.pkl", latest)
-    row["no2_pred"]  = predict(MODELS / f"lin_no2_t+{H}.pkl",  latest)
+    row["pm25_pred"] = predict(MODELS / f"lin_sydney_pm25_t+{H}.pkl", latest)
+    row["no2_pred"]  = predict(MODELS / f"lin_sydney_no2_t+{H}.pkl",  latest)
 
     # add met predictions (all suburbs + city)
     for tgt in met_columns:
