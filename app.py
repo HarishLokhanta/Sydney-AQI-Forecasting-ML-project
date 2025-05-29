@@ -13,34 +13,36 @@ from pathlib import Path
 
 # ──────────── AQI helpers ─────────────────────────────────────
 _PM25_BP = [
-    (0,12,0,50),(12.1,35.4,51,100),(35.5,55.4,101,150),
-    (55.5,150.4,151,200),(150.5,250.4,201,300),
-    (250.5,350.4,301,400),(350.5,500.4,401,500),
+    (0,   12,   0,  50), (12.1,35.4, 51,100),
+    (35.5,55.4,101,150),(55.5,150.4,151,200),
+    (150.5,250.4,201,300),(250.5,350.4,301,400),
+    (350.5,500.4,401,500),
 ]
 _NO2_BP = [
-    (0,53,0,50),(54,100,51,100),(101,360,101,150),
-    (361,649,151,200),(650,1249,201,300),
-    (1250,1649,301,400),(1650,2049,401,500),
+    (0,   53,   0,  50), (54, 100,  51,100),
+    (101,360,101,150),(361,649,151,200),
+    (650,1249,201,300),(1250,1649,301,400),
+    (1650,2049,401,500),
 ]
 
-def _interp(v,bp):
+def _interp(v, bp):
     for lo, hi, ilo, ihi in bp:
         if lo <= v <= hi:
-            return (ihi-ilo)/(hi-lo)*(v-lo)+ilo
+            return (ihi - ilo) / (hi - lo) * (v - lo) + ilo
     return np.nan
 
-def aqi_idx(pm,no2):
-    return max(_interp(pm,_PM25_BP),
-               _interp(no2*0.522,_NO2_BP))
+def aqi_idx(pm, no2):
+    return max(
+        _interp(pm,      _PM25_BP),
+        _interp(no2*0.522,_NO2_BP)
+    )
 
 def aqi_category(aqi: float):
-    """Return (label,colour) for AQI badge (badge always green)."""
-    if aqi <= 150:
-        return "AQI", "#4CAF50"
+    """Return (label,colour) for AQI badge (always green here)."""
     return "AQI", "#4CAF50"
 
 # ─── meteorology corrections ───────────────────────────────────
-ALPHA,BETA,GAMMA,H0 = 0.20,1.3,0.05,1000
+ALPHA, BETA, GAMMA, H0 = 0.20, 1.3, 0.05, 1000
 pm_hum_corr  = lambda p,r: p/(1+ALPHA*(r/100)**BETA)
 pm_wind_corr = lambda p,w: max(p*(1-GAMMA*w),0.5*p)
 pm_temp_corr = lambda p,t: max(p*(H0/(100*t+150)),0.5*p)
@@ -77,8 +79,8 @@ forecast_df = pd.read_csv(REPORT_DIR/"aqi_forecast.csv")
 st.set_page_config(page_title="Sydney AQI Forecaster", layout="wide", page_icon="🌬️")
 st.markdown("""
     <style>
-      .stApp {background-color:#000;}         /* black page bg */
-      .css-1d391kg {background-color:#ADD8E6;}   /* light-blue sidebar */
+      .stApp {background-color:#000;}         /* black bg */
+      .css-1d391kg {background-color:#ADD8E6;} /* light-blue sidebar */
     </style>
 """, unsafe_allow_html=True)
 
@@ -89,7 +91,7 @@ if "health_status" not in st.session_state:
     c1,c2,c3 = st.columns([1,2,1])
     with c2:
         st.markdown("<h2 style='text-align:center;'>Your respiratory status</h2>", unsafe_allow_html=True)
-        st.radio("", ["Healthy","Asthma","COPD / Bronchitis","Other"],
+        st.radio("", ["Healthy","Asthma","COPD","Other"],
                  key="health_temp", index=0, horizontal=True, label_visibility="collapsed")
         st.button("Confirm", on_click=_set_health, use_container_width=True)
     st.stop()
@@ -127,22 +129,19 @@ with tab1:
             raw    = load_raw_data(DATA_DIR)
             latest = raw.dropna().iloc[[-1]]
 
-            prefix = "lin_sydney" if mdl == "Linear Regression" else "rf"
-
-            # Load the correct PM2.5 model file
-            if mdl == "Random Forest":
-                pm_m = joblib.load(
-                    BASE/"models"/f"{prefix}_pm_adjust_t+{horizon}.pkl"
-                )
+            # PM2.5 model selection
+            prefix = "lin_sydney" if mdl=="Linear Regression" else "rf"
+            if mdl=="Random Forest":
+                pm_m = joblib.load(BASE/"models"/f"{prefix}_pm_adjust_t+{horizon}.pkl")
             else:
-                pm_m = joblib.load(
-                    BASE/"models"/f"{prefix}_pm25_t+{horizon}.pkl"
-                )
+                pm_m = joblib.load(BASE/"models"/f"{prefix}_pm25_t+{horizon}.pkl")
 
-            # NO₂ model remains unchanged
-            no2_m = joblib.load(
-                BASE/"models"/f"{prefix}_no2_t+{horizon}.pkl"
-            )
+            # NO₂ always from the *linear* files
+            no2_pkl = BASE/"models"/f"lin_sydney_no2_t+{horizon}.pkl"
+            if not no2_pkl.exists():
+                # fallback (really worst–case)
+                no2_pkl = BASE/"models"/f"rf_pm_adjust_t+{horizon}.pkl"
+            no2_m = joblib.load(no2_pkl)
 
             pm  = float(pm_m["model"].predict(align(pm_m, latest))[0])
             no2 = float(no2_m["model"].predict(align(no2_m, latest))[0])
@@ -151,37 +150,32 @@ with tab1:
             def pmet(stub):
                 fp = BASE/"models"/f"rf_sydney_{stub}_t+{horizon}.pkl"
                 if fp.exists():
-                    m = joblib.load(fp)
-                    return float(m["model"].predict(align(m, latest))[0])
+                    o = joblib.load(fp)
+                    return float(o["model"].predict(align(o, latest))[0])
                 return None
 
-            wsp, tmp, rh = (
-                pmet("wsp_1h_average_m_s"),
-                pmet("temp_1h_average_c"),
-                pmet("humid_1h_average_%")
-            )
+            wsp, tmp, rh = pmet("wsp_1h_average_m_s"), pmet("temp_1h_average_c"), pmet("humid_1h_average_%")
 
+            # raw + adjusted AQI
             aqi_raw = aqi_idx(pm, no2)
             pm_adj  = pm
-            if rh  is not None: pm_adj = pm_hum_corr(pm_adj, rh)
+            if rh is not None: pm_adj = pm_hum_corr(pm_adj, rh)
             if wsp is not None: pm_adj = pm_wind_corr(pm_adj, wsp)
             if tmp is not None: pm_adj = pm_temp_corr(pm_adj, tmp)
             aqi_adj = aqi_idx(pm_adj, no2)
 
+            # personalized advice
             def advice(a,s):
-                if s == "Healthy":
-                    return "All good 😊" if a <= 100 else \
-                           ("Lighten up" if a <= 150 else "Limit outdoor time")
+                if s=="Healthy":
+                    return "All good 😊" if a<=100 else ("Lighten up" if a<=150 else "Limit outdoor time")
                 else:
-                    return "Fine 👍" if a <= 50 else \
-                           ("Reduce exertion" if a <= 100 else \
-                           ("Limit time outside" if a <= 150 else "Stay indoors"))
+                    return "Fine 👍" if a<=50 else ("Reduce exertion" if a<=100 else ("Limit time outside" if a<=150 else "Stay indoors"))
 
             st.info(advice(aqi_adj, health_status))
 
+            # badge + metrics
             st.markdown(
-                f"<div style='background:#4CAF50;color:black;padding:8px;"
-                f"border-radius:6px;display:inline-block;'>"
+                f"<div style='background:#4CAF50;color:black;padding:8px;border-radius:6px;display:inline-block;'>"
                 f"<b>AQI {aqi_adj:.0f}</b></div>",
                 unsafe_allow_html=True
             )
